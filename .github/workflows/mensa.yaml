@@ -1,0 +1,51 @@
+name: Mensa poll
+
+on:
+  schedule:
+    # GitHub cron is UTC. Both entries run; the script only posts in the
+    # run that lands in 11:xx Zurich time (CEST = 09:15 UTC, CET = 10:15 UTC).
+    - cron: "15 9 * * 1-5"
+    - cron: "15 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "post = send to Mattermost, dry_run = print only, probe = dump ETH/UZH pages"
+        type: choice
+        options: [dry_run, post, probe]
+        default: dry_run
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Run
+        env:
+          MATTERMOST_WEBHOOK_URL: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+          MATTERMOST_CHANNEL: ${{ secrets.MATTERMOST_CHANNEL }}
+          EVENT: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT" = "schedule" ]; then
+            python mensa_bot.py --only-at-lunch-hour
+          elif [ "$MODE" = "probe" ]; then
+            python mensa_bot.py --probe
+          elif [ "$MODE" = "post" ]; then
+            python mensa_bot.py
+          else
+            python mensa_bot.py --dry-run
+          fi
+      - name: Upload probe output
+        if: ${{ inputs.mode == 'probe' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe
+          path: probe/
