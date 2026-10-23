@@ -57,14 +57,14 @@ class Mensa:
 
 
 # ETH ids verified against the facility list: 3 Clausiusbar, 9 Mensa Polyterrasse, 10 Polysnack.
-# UZH: only Platte's food2050 path is verified. The Obere/Untere paths are GUESSES following the
-# same pattern; run mode=probe (it prints the real food2050 urls found on the zfv.ch pages).
+# UZH food2050 paths: Platte and Obere Mensa are verified from real pages. Untere Mensa is a GUESS
+# mirroring Obere; if it warns, open its menu on zfv.ch, click a dish and send the app.food2050.ch url.
 MENSAS = [
     Mensa("obere", "Obere Mensa", "uzh", "one",
-          food2050="universitat-zurich,obere-mensa-uzh/obere-mensa-uzh/mittagsverpflegung",
+          food2050="universitat-zurich,campus-zentrum/obere-mensa/lunch",
           info_url=f"{ZFV_BASE}/obere-mensa-uzh#menu"),
     Mensa("untere", "Untere Mensa", "uzh", "two",
-          food2050="universitat-zurich,untere-mensa-uzh/untere-mensa-uzh/mittagsverpflegung",
+          food2050="universitat-zurich,campus-zentrum/untere-mensa/lunch",  # GUESS, mirrors Obere
           info_url=f"{ZFV_BASE}/untere-mensa-uzh#menu"),
     Mensa("platte", "Platte", "uzh", "three",
           food2050="universitat-zurich,platte-14/platte-14/mittagsverpflegung",
@@ -198,8 +198,12 @@ def fetch_zfv(m: Mensa, day: dt.date) -> list[Dish]:
     r = requests.get(f"{FOOD2050}/{m.food2050}/menu/weekly", headers=UA, timeout=20,
                      params={"week": iso.week, "year": iso.year, "day": iso.weekday})
     r.raise_for_status()
+    try:
+        entries = parse_zfv_week(r.text, day)
+    except ValueError as e:  # food2050 answers 200 even for unknown paths, so name the url
+        raise ValueError(f"{e} [{FOOD2050}/{m.food2050}]") from None
     dishes = []
-    for e in parse_zfv_week(r.text, day):
+    for e in entries:
         price, tags = None, ()
         try:  # prices live on the dish page; a failure only costs the price
             d = requests.get(e["href"], headers=UA, timeout=20)

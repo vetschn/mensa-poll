@@ -73,6 +73,20 @@ DISH = ('<div><span>Vegan</span></div><h1>TAJINE<span>Auberginen</span></h1><p>6
 assert b.parse_zfv_dish(DISH, "Tajine") == ("6.90", ("vegan",))
 assert b.parse_zfv_dish("<h1>CURRY</h1><p>no prices</p>", "Curry") == (None, ())
 
+# ---- Obere Mensa: real structure (lines "Menu 1..4", path universitat-zurich,campus-zentrum/obere-mensa/lunch) ----
+O = "https://app.food2050.ch/de/zfv/universitat-zurich,campus-zentrum/obere-mensa/lunch"
+def row(label, items):
+    cells = "".join(f"<div>{a(f'{O},{label.lower().replace(chr(32), chr(45))}/{d}', n, ds)}</div>" for d, n, ds in items)
+    return f'<div class="WeeklyMenuTableLargeScreen__BodyRow-sc-b7ecf598-3"><div><p class="shared__ItemDisplayName-sc-508a2185-1">{label}</p></div>{cells}</div>'
+OBERE = "<div>" + row("Menu 1", [("2026-10-22", "ROTES POULET CURRY", "Broccoli, Karotten"),
+                                  ("2026-10-23", "WALDPILZRISOTTO", "Spinat, Mandeln, Reibkäse, Menüsalat / Apfelmus")]) \
+      + row("Menu 3", [("2026-10-23", "GHACKETS &amp; HÖRNLI", "Rindshackfleisch, Reibkäse")]) \
+      + row("Menu 4", [("2026-10-23", "PANIERTES SCHNITZEL", "Pommes frites")]) + "</div>"
+o = b.parse_zfv_week(OBERE, dt.date(2026, 10, 23))
+assert [(x["line"], x["name"]) for x in o] == [("Menu 1", "Waldpilzrisotto"), ("Menu 3", "Ghackets & Hörnli"),
+                                                ("Menu 4", "Paniertes Schnitzel")], o
+assert next(m for m in b.MENSAS if m.key == "obere").food2050 == "universitat-zurich,campus-zentrum/obere-mensa/lunch"
+
 # ---- message ----
 res = {m.key: None for m in b.MENSAS}
 res["polysnack"] = d
