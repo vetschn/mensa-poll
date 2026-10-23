@@ -3,6 +3,10 @@
 
 The message is sent through an incoming webhook. Webhooks cannot create
 Matterpoll polls, so the message ends with a ready-to-paste /poll command.
+
+Sources
+- ETH: the "cookpit" API that powers the ethz.ch menu pages (JSON, facility ids).
+- UZH: the food2050 app that zfv.ch embeds for the UZH mensas (server-rendered HTML).
 """
 from __future__ import annotations
 
@@ -11,33 +15,34 @@ import datetime as dt
 import os
 import re
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+from bs4 import BeautifulSoup
 
 TZ = ZoneInfo("Europe/Zurich")
 POST_HOUR = 11  # local hour in which the scheduled run is allowed to post
 
+ETH_API = "https://idapps.ethz.ch/cookpit-pub-services/v1"
 ETH_OFFER_DAY = (
     "https://ethz.ch/de/campus/erleben/gastronomie-und-einkaufen/gastronomie/"
     "menueplaene/offerDay.html"
 )
-ETH_INFO = (
-    "https://ethz.ch/en/campus/getting-to-know/cafes-restaurants-shops/gastronomy/"
-    "restaurants-and-cafeterias/zentrum"
-)
+FOOD2050 = "https://app.food2050.ch/de/zfv"
+ZFV_BASE = "https://www.zfv.ch/de/essen-gehen"
 UA = {"User-Agent": "mensa-poll-bot (github actions; lunch poll for a small team)"}
+SOLD_OUT = {"sold out", "ausverkauft", "esaurito"}
 
 
 @dataclass
 class Dish:
-    category: str  # e.g. "Garden", "Wok"
-    description: str
+    category: str  # serving line, e.g. "Pasta", "Yin"
+    name: str
+    description: str = ""
     price: str | None = None  # STUDENT price, e.g. "7.50"
-    tags: tuple[str, ...] = ()  # e.g. ("vegan",)
+    tags: tuple[str, ...] = ()  # "vegan" / "vegetarian"
 
 
 @dataclass
@@ -46,57 +51,182 @@ class Mensa:
     name: str
     source: str  # "eth" or "uzh"
     emoji: str  # Mattermost emoji name
-    eth_id: int | None = None  # menu-plan id, found with --probe
-    info_url: str | None = None  # link shown in the message
-    uzh_url: str | None = None  # menu page, found with --probe-url
+    eth_id: int | None = None  # ETH facility id (same as id= on the ethz.ch menu page)
+    food2050: str | None = None  # food2050 path: <org>/<facility>/<meal-service>
+    info_url: str | None = None  # fallback link
 
 
-# TODO ids/urls: run the workflow with mode=probe, then fill them in.
-# Hints: Clausiusbar was id=4 (2022) and id=3 (2025 README); Polysnack was 13 (2020).
+# ETH ids verified against the facility list: 3 Clausiusbar, 9 Mensa Polyterrasse, 10 Polysnack.
+# UZH: only Platte's food2050 path is verified. The Obere/Untere paths are GUESSES following the
+# same pattern; run mode=probe (it prints the real food2050 urls found on the zfv.ch pages).
 MENSAS = [
-    Mensa("unimensa", "Unimensa", "uzh", "one"),
-    Mensa("platte", "Platte", "uzh", "two"),
-    Mensa("clausius", "Clausiusbar", "eth", "three", info_url=f"{ETH_INFO}/clausiusbar.html"),
-    Mensa("polymensa", "Polymensa", "eth", "four", info_url=f"{ETH_INFO}.html"),
-    Mensa("polysnack", "Polysnack", "eth", "five", info_url=f"{ETH_INFO}/polysnack.html"),
+    Mensa("obere", "Obere Mensa", "uzh", "one",
+          food2050="universitat-zurich,obere-mensa-uzh/obere-mensa-uzh/mittagsverpflegung",
+          info_url=f"{ZFV_BASE}/obere-mensa-uzh#menu"),
+    Mensa("untere", "Untere Mensa", "uzh", "two",
+          food2050="universitat-zurich,untere-mensa-uzh/untere-mensa-uzh/mittagsverpflegung",
+          info_url=f"{ZFV_BASE}/untere-mensa-uzh#menu"),
+    Mensa("platte", "Platte", "uzh", "three",
+          food2050="universitat-zurich,platte-14/platte-14/mittagsverpflegung",
+          info_url=f"{ZFV_BASE}/platte-14#menu"),
+    Mensa("clausius", "Clausiusbar", "eth", "four", eth_id=3),
+    Mensa("polymensa", "Polymensa", "eth", "five", eth_id=9),
+    Mensa("polysnack", "Polysnack", "eth", "six", eth_id=10),
 ]
 
 
+def menu_link(m: Mensa, day: dt.date) -> str | None:
+    if m.source == "eth" and m.eth_id is not None:
+        return f"{ETH_OFFER_DAY}?date={day.isoformat()}&id={m.eth_id}"
+    return m.info_url
+
+
 # --------------------------------------------------------------------------
-# Fetching + parsing (parsers are written once we have real HTML samples)
+# ETH
 # --------------------------------------------------------------------------
-def eth_params(mensa_id: int, day: dt.date) -> dict:
-    return {"language": "en", "date": day.isoformat(), "id": mensa_id}
+def week_bounds(day: dt.date) -> tuple[dt.date, dt.date]:
+    monday = day - dt.timedelta(days=day.weekday())
+    return monday, monday + dt.timedelta(days=7)
 
 
-def parse_eth(html: str) -> list[Dish]:
-    raise NotImplementedError("ETH parser needs a real HTML sample (see --probe)")
+def eth_rota_params(facility: int, day: dt.date, lang: str = "en") -> dict:
+    after, before = week_bounds(day)
+    return {
+        "client-id": "ethz-wcms", "lang": lang, "rs-first": 0, "rs-size": 50,
+        "valid-after": after.isoformat(), "valid-before": before.isoformat(), "facility": facility,
+    }
 
 
-def parse_uzh(html: str) -> list[Dish]:
-    raise NotImplementedError("UZH parser needs a real HTML sample (see --probe-url)")
+def _is_lunch(meal_time: dict) -> bool:
+    name = (meal_time.get("name") or "").lower()
+    if any(w in name for w in ("dinner", "abend", "cena")):
+        return False
+    start = meal_time.get("time-from")
+    return not (start and start >= "15:00")
 
 
+def _student_price(meal: dict) -> str | None:
+    for p in meal.get("meal-price-array") or []:
+        if "student" in (p.get("customer-group-desc") or "").lower() and p.get("price") is not None:
+            return f"{float(p['price']):.2f}"
+    return None
+
+
+def _eth_tags(meal: dict) -> tuple[str, ...]:
+    classes = [(c.get("desc") or "").lower() for c in meal.get("meal-class-array") or []]
+    if any("vegan" in c for c in classes):
+        return ("vegan",)
+    if any("vegetarian" in c for c in classes):
+        return ("vegetarian",)
+    return ()
+
+
+def parse_eth(data: dict, day: dt.date) -> list[Dish]:
+    """[] = nothing served that day (closed / no menu published)."""
+    if not isinstance(data, dict) or "weekly-rota-array" not in data:
+        raise ValueError("unexpected ETH response shape")
+    dishes: list[Dish] = []
+    seen: set[object] = set()
+    for rota in data["weekly-rota-array"]:
+        vf, vt = rota.get("valid-from"), rota.get("valid-to")
+        if vf and vt and not (vf <= day.isoformat() <= vt):
+            continue
+        for d in rota.get("day-of-week-array") or []:
+            if d.get("day-of-week-code") != day.isoweekday():
+                continue
+            for hours in d.get("opening-hour-array") or []:
+                for mt in hours.get("meal-time-array") or []:
+                    if not _is_lunch(mt):
+                        continue
+                    for line in mt.get("line-array") or []:
+                        meal = line.get("meal")
+                        for ml in meal if isinstance(meal, list) else [meal] if meal else []:
+                            name = (ml.get("name") or "").strip()
+                            if not name or name.lower() in SOLD_OUT or ml.get("line-id") in seen:
+                                continue
+                            seen.add(ml.get("line-id"))
+                            dishes.append(Dish(
+                                (line.get("name") or "").strip(), name,
+                                (ml.get("description") or "").strip(), _student_price(ml), _eth_tags(ml),
+                            ))
+    return dishes
+
+
+# --------------------------------------------------------------------------
+# UZH (food2050)
+# --------------------------------------------------------------------------
+def parse_zfv_week(html: str, day: dt.date) -> list[dict]:
+    """Dishes of one day from the food2050 weekly page. Class names are hashed, so match prefixes."""
+    soup = BeautifulSoup(html, "html.parser")
+    date_href = re.compile(r"/\d{4}-\d{2}-\d{2}/?$")
+    cells = [a for a in soup.find_all("a", href=date_href) if a.find(class_=re.compile("DishName__Name"))]
+    if not cells:
+        raise ValueError("no dish cells found: page layout changed or not server-rendered")
+    out, seen = [], set()
+    for a in cells:
+        href = a["href"]
+        if not href.rstrip("/").endswith(day.isoformat()) or href in seen:
+            continue
+        seen.add(href)
+        line = a.find_previous("p", class_=re.compile("ItemDisplayName"))
+        name = a.find(class_=re.compile("DishName__Name")).get_text(" ", strip=True)
+        desc = a.find(class_=re.compile("DishName__Description"))
+        out.append({
+            "line": line.get_text(strip=True) if line else "",
+            "name": name.title() if name.isupper() else name,
+            "description": desc.get_text(" ", strip=True) if desc else "",
+            "href": href,
+        })
+    return out
+
+
+def parse_zfv_dish(html: str, name: str) -> tuple[str | None, tuple[str, ...]]:
+    """Student price + diet tag from a food2050 dish page."""
+    text = BeautifulSoup(html, "html.parser").get_text("\n")
+    m = re.search(r"(\d+(?:\.\d+)?)\s*CHF\s*Studierende", text)
+    price = f"{float(m.group(1)):.2f}" if m else None
+    idx = text.lower().find(name.lower())
+    before = text[:idx].lower() if idx > 0 else text[:200].lower()
+    tags = ("vegan",) if "vegan" in before else ("vegetarian",) if "vegetarisch" in before else ()
+    return price, tags
+
+
+def fetch_zfv(m: Mensa, day: dt.date) -> list[Dish]:
+    if not m.food2050:
+        raise LookupError("no food2050 path configured")
+    iso = day.isocalendar()
+    r = requests.get(f"{FOOD2050}/{m.food2050}/menu/weekly", headers=UA, timeout=20,
+                     params={"week": iso.week, "year": iso.year, "day": iso.weekday})
+    r.raise_for_status()
+    dishes = []
+    for e in parse_zfv_week(r.text, day):
+        price, tags = None, ()
+        try:  # prices live on the dish page; a failure only costs the price
+            d = requests.get(e["href"], headers=UA, timeout=20)
+            d.raise_for_status()
+            price, tags = parse_zfv_dish(d.text, e["name"])
+        except requests.RequestException as ex:
+            print(f"[warn] {m.name}: price lookup failed ({type(ex).__name__})", file=sys.stderr)
+        dishes.append(Dish(e["line"], e["name"], e["description"], price, tags))
+    return dishes
+
+
+# --------------------------------------------------------------------------
 def fetch_menu(m: Mensa, day: dt.date) -> list[Dish]:
     if m.source == "eth":
-        if m.eth_id is None:
-            raise LookupError("no eth_id configured")
-        r = requests.get(ETH_OFFER_DAY, params=eth_params(m.eth_id, day), headers=UA, timeout=20)
+        r = requests.get(f"{ETH_API}/weeklyrotas", params=eth_rota_params(m.eth_id, day),
+                         headers=UA, timeout=20)
         r.raise_for_status()
-        return parse_eth(r.text)
-    if m.uzh_url is None:
-        raise LookupError("no uzh_url configured")
-    r = requests.get(m.uzh_url, headers=UA, timeout=20)
-    r.raise_for_status()
-    return parse_uzh(r.text)
+        return parse_eth(r.json(), day)
+    return fetch_zfv(m, day)
 
 
 def safe_fetch(m: Mensa, day: dt.date) -> list[Dish] | None:
-    """None = unknown (error / not configured), [] = nothing served today."""
+    """None = unknown (error), [] = nothing served today."""
     try:
         return fetch_menu(m, day)
-    except Exception as e:  # noqa: BLE001 - keep the run alive, log only the type
-        print(f"[warn] {m.name}: {type(e).__name__}: {e}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 - keep the run alive
+        print(f"[warn] {m.name}: {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
         return None
 
 
@@ -104,14 +234,15 @@ def safe_fetch(m: Mensa, day: dt.date) -> list[Dish] | None:
 # Message building
 # --------------------------------------------------------------------------
 def cell(text: str) -> str:
-    return re.sub(r"\s+", " ", text.replace("|", "/")).strip()
+    text = text.replace(" | ", ", ").replace("|", "/")
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def build_message(day: dt.date, results: dict[str, list[Dish] | None]) -> str:
     out = [f"#### :fork_and_knife: Lunch options, {day:%A %d %B %Y}", ""]
     for m in MENSAS:
-        title = f"[{m.name}]({m.info_url})" if m.info_url else m.name
-        out.append(f"##### :{m.emoji}: {title}")
+        link = menu_link(m, day)
+        out.append(f"##### :{m.emoji}: " + (f"[{m.name}]({link})" if link else m.name))
         dishes = results[m.key]
         if dishes is None:
             out.append("_Menu unavailable._")
@@ -121,8 +252,9 @@ def build_message(day: dt.date, results: dict[str, list[Dish] | None]) -> str:
             out += ["| Menu | Dish | Student price |", "|---|---|---:|"]
             for d in dishes:
                 tags = f" _({', '.join(d.tags)})_" if d.tags else ""
+                desc = f": {cell(d.description)}" if d.description else ""
                 price = f"CHF {d.price}" if d.price else "–"
-                out.append(f"| {cell(d.category)} | {cell(d.description)}{tags} | {price} |")
+                out.append(f"| {cell(d.category)} | **{cell(d.name)}**{desc}{tags} | {price} |")
         out.append("")
 
     options = [m.name for m in MENSAS if results[m.key] is None or results[m.key]]
@@ -145,31 +277,31 @@ def post(webhook_url: str, text: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# Probe: discover ETH ids and dump raw HTML for writing the parsers
+# Probe: find the real food2050 paths of the UZH mensas
 # --------------------------------------------------------------------------
-def probe(day: dt.date, extra_urls: list[str]) -> None:
+def probe(day: dt.date) -> None:
     out = Path("probe")
     out.mkdir(exist_ok=True)
-    for i in range(1, 41):
+    for m in MENSAS:
+        if m.source != "uzh":
+            continue
+        slug = (m.info_url or "").split("/")[-1].split("#")[0]
         try:
-            r = requests.get(ETH_OFFER_DAY, params=eth_params(i, day), headers=UA, timeout=20)
-            (out / f"eth_{i}.html").write_text(r.text, encoding="utf-8")
-            text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text)).strip()
-            print(f"eth id={i:>2} status={r.status_code} bytes={len(r.text):>6} | {text[:140]}")
+            r = requests.get(f"{ZFV_BASE}/{slug}", headers=UA, timeout=20)
+            (out / f"zfv_{slug}.html").write_text(r.text, encoding="utf-8")
+            urls = sorted(set(re.findall(r"https?://app\.food2050\.ch/[^\"'\s<>\\]+", r.text)))
+            print(f"zfv {slug}: status={r.status_code} bytes={len(r.text)} food2050 urls: {urls[:5]}")
         except requests.RequestException as e:
-            print(f"eth id={i:>2} {type(e).__name__}")
-        time.sleep(0.3)
-    urls = extra_urls or [
-        "https://www.mensa.uzh.ch/en.html",
-        "https://www.mensa.uzh.ch/en/standorte.html",
-    ]
-    for n, url in enumerate(urls):
-        try:
-            r = requests.get(url, headers=UA, timeout=20)
-            (out / f"uzh_{n}.html").write_text(r.text, encoding="utf-8")
-            print(f"uzh[{n}] {url} status={r.status_code} bytes={len(r.text)}")
-        except requests.RequestException as e:
-            print(f"uzh[{n}] {url} {type(e).__name__}")
+            print(f"zfv {slug}: {type(e).__name__}")
+        if m.food2050:
+            iso = day.isocalendar()
+            try:
+                r = requests.get(f"{FOOD2050}/{m.food2050}/menu/weekly", headers=UA, timeout=20,
+                                 params={"week": iso.week, "year": iso.year, "day": iso.weekday})
+                (out / f"food2050_{m.key}.html").write_text(r.text, encoding="utf-8")
+                print(f"food2050 {m.key}: status={r.status_code} bytes={len(r.text)}")
+            except requests.RequestException as e:
+                print(f"food2050 {m.key}: {type(e).__name__}")
 
 
 # --------------------------------------------------------------------------
@@ -183,7 +315,6 @@ def main() -> int:
     ap.add_argument("--only-at-lunch-hour", action="store_true", help="skip unless it is 11:xx in Zurich")
     ap.add_argument("--dry-run", action="store_true", help="print instead of posting")
     ap.add_argument("--probe", action="store_true")
-    ap.add_argument("--probe-url", action="append", default=[])
     ap.add_argument("--date", type=dt.date.fromisoformat)
     args = ap.parse_args()
 
@@ -191,7 +322,7 @@ def main() -> int:
     day = args.date or now.date()
 
     if args.probe:
-        probe(day, args.probe_url)
+        probe(day)
         return 0
     if args.only_at_lunch_hour and not at_lunch_hour(now):
         print(f"Not posting: local time is {now:%a %H:%M}.")
