@@ -8,6 +8,7 @@ Sources
 - ETH: the "cookpit" API that powers the ethz.ch menu pages (JSON, facility ids).
 - UZH: the food2050 app that zfv.ch embeds for the UZH mensas (server-rendered HTML).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -57,18 +58,32 @@ class Mensa:
 
 
 # ETH ids verified against the facility list: 3 Clausiusbar, 9 Mensa Polyterrasse, 10 Polysnack.
-# UZH food2050 paths: Platte and Obere Mensa are verified from real pages. Untere Mensa is a GUESS
-# mirroring Obere; if it warns, open its menu on zfv.ch, click a dish and send the app.food2050.ch url.
+# UZH food2050 paths: all three verified from the real weekly pages (they differ per mensa).
 MENSAS = [
-    Mensa("obere", "Obere Mensa", "uzh", "one",
-          food2050="universitat-zurich,campus-zentrum/obere-mensa/lunch",
-          info_url=f"{ZFV_BASE}/obere-mensa-uzh#menu"),
-    Mensa("untere", "Untere Mensa", "uzh", "two",
-          food2050="universitat-zurich,campus-zentrum/untere-mensa/lunch",  # GUESS, mirrors Obere
-          info_url=f"{ZFV_BASE}/untere-mensa-uzh#menu"),
-    Mensa("platte", "Platte", "uzh", "three",
-          food2050="universitat-zurich,platte-14/platte-14/mittagsverpflegung",
-          info_url=f"{ZFV_BASE}/platte-14#menu"),
+    Mensa(
+        "obere",
+        "Obere Mensa",
+        "uzh",
+        "one",
+        food2050="universitat-zurich,campus-zentrum/obere-mensa/lunch",
+        info_url=f"{ZFV_BASE}/obere-mensa-uzh#menu",
+    ),
+    Mensa(
+        "untere",
+        "Untere Mensa",
+        "uzh",
+        "two",
+        food2050="universitat-zurich,campus-zentrum/untere-mensa/mittagsverpflegung",
+        info_url=f"{ZFV_BASE}/untere-mensa-uzh#menu",
+    ),
+    Mensa(
+        "platte",
+        "Platte",
+        "uzh",
+        "three",
+        food2050="universitat-zurich,platte-14/platte-14/mittagsverpflegung",
+        info_url=f"{ZFV_BASE}/platte-14#menu",
+    ),
     Mensa("clausius", "Clausiusbar", "eth", "four", eth_id=3),
     Mensa("polymensa", "Polymensa", "eth", "five", eth_id=9),
     Mensa("polysnack", "Polysnack", "eth", "six", eth_id=10),
@@ -92,8 +107,13 @@ def week_bounds(day: dt.date) -> tuple[dt.date, dt.date]:
 def eth_rota_params(facility: int, day: dt.date, lang: str = "en") -> dict:
     after, before = week_bounds(day)
     return {
-        "client-id": "ethz-wcms", "lang": lang, "rs-first": 0, "rs-size": 50,
-        "valid-after": after.isoformat(), "valid-before": before.isoformat(), "facility": facility,
+        "client-id": "ethz-wcms",
+        "lang": lang,
+        "rs-first": 0,
+        "rs-size": 50,
+        "valid-after": after.isoformat(),
+        "valid-before": before.isoformat(),
+        "facility": facility,
     }
 
 
@@ -107,13 +127,18 @@ def _is_lunch(meal_time: dict) -> bool:
 
 def _student_price(meal: dict) -> str | None:
     for p in meal.get("meal-price-array") or []:
-        if "student" in (p.get("customer-group-desc") or "").lower() and p.get("price") is not None:
+        if (
+            "student" in (p.get("customer-group-desc") or "").lower()
+            and p.get("price") is not None
+        ):
             return f"{float(p['price']):.2f}"
     return None
 
 
 def _eth_tags(meal: dict) -> tuple[str, ...]:
-    classes = [(c.get("desc") or "").lower() for c in meal.get("meal-class-array") or []]
+    classes = [
+        (c.get("desc") or "").lower() for c in meal.get("meal-class-array") or []
+    ]
     if any("vegan" in c for c in classes):
         return ("vegan",)
     if any("vegetarian" in c for c in classes):
@@ -140,15 +165,26 @@ def parse_eth(data: dict, day: dt.date) -> list[Dish]:
                         continue
                     for line in mt.get("line-array") or []:
                         meal = line.get("meal")
-                        for ml in meal if isinstance(meal, list) else [meal] if meal else []:
+                        for ml in (
+                            meal if isinstance(meal, list) else [meal] if meal else []
+                        ):
                             name = (ml.get("name") or "").strip()
-                            if not name or name.lower() in SOLD_OUT or ml.get("line-id") in seen:
+                            if (
+                                not name
+                                or name.lower() in SOLD_OUT
+                                or ml.get("line-id") in seen
+                            ):
                                 continue
                             seen.add(ml.get("line-id"))
-                            dishes.append(Dish(
-                                (line.get("name") or "").strip(), name,
-                                (ml.get("description") or "").strip(), _student_price(ml), _eth_tags(ml),
-                            ))
+                            dishes.append(
+                                Dish(
+                                    (line.get("name") or "").strip(),
+                                    name,
+                                    (ml.get("description") or "").strip(),
+                                    _student_price(ml),
+                                    _eth_tags(ml),
+                                )
+                            )
     return dishes
 
 
@@ -159,9 +195,15 @@ def parse_zfv_week(html: str, day: dt.date) -> list[dict]:
     """Dishes of one day from the food2050 weekly page. Class names are hashed, so match prefixes."""
     soup = BeautifulSoup(html, "html.parser")
     date_href = re.compile(r"/\d{4}-\d{2}-\d{2}/?$")
-    cells = [a for a in soup.find_all("a", href=date_href) if a.find(class_=re.compile("DishName__Name"))]
+    cells = [
+        a
+        for a in soup.find_all("a", href=date_href)
+        if a.find(class_=re.compile("DishName__Name"))
+    ]
     if not cells:
-        raise ValueError("no dish cells found: page layout changed or not server-rendered")
+        raise ValueError(
+            "no dish cells found: page layout changed or not server-rendered"
+        )
     out, seen = [], set()
     for a in cells:
         href = a["href"]
@@ -171,12 +213,18 @@ def parse_zfv_week(html: str, day: dt.date) -> list[dict]:
         line = a.find_previous("p", class_=re.compile("ItemDisplayName"))
         name = a.find(class_=re.compile("DishName__Name")).get_text(" ", strip=True)
         desc = a.find(class_=re.compile("DishName__Description"))
-        out.append({
-            "line": line.get_text(strip=True) if line else "",
-            "name": name.title() if name.isupper() else name,
-            "description": desc.get_text(" ", strip=True) if desc else "",
-            "href": href,
-        })
+        out.append(
+            {
+                "line": (lambda t: t.title() if t.islower() else t)(
+                    line.get_text(strip=True)
+                )
+                if line
+                else "",
+                "name": name.title() if name.isupper() else name,
+                "description": desc.get_text(" ", strip=True) if desc else "",
+                "href": href,
+            }
+        )
     return out
 
 
@@ -187,7 +235,13 @@ def parse_zfv_dish(html: str, name: str) -> tuple[str | None, tuple[str, ...]]:
     price = f"{float(m.group(1)):.2f}" if m else None
     idx = text.lower().find(name.lower())
     before = text[:idx].lower() if idx > 0 else text[:200].lower()
-    tags = ("vegan",) if "vegan" in before else ("vegetarian",) if "vegetarisch" in before else ()
+    tags = (
+        ("vegan",)
+        if "vegan" in before
+        else ("vegetarian",)
+        if "vegetarisch" in before
+        else ()
+    )
     return price, tags
 
 
@@ -195,12 +249,18 @@ def fetch_zfv(m: Mensa, day: dt.date) -> list[Dish]:
     if not m.food2050:
         raise LookupError("no food2050 path configured")
     iso = day.isocalendar()
-    r = requests.get(f"{FOOD2050}/{m.food2050}/menu/weekly", headers=UA, timeout=20,
-                     params={"week": iso.week, "year": iso.year, "day": iso.weekday})
+    r = requests.get(
+        f"{FOOD2050}/{m.food2050}/menu/weekly",
+        headers=UA,
+        timeout=20,
+        params={"week": iso.week, "year": iso.year, "day": iso.weekday},
+    )
     r.raise_for_status()
     try:
         entries = parse_zfv_week(r.text, day)
-    except ValueError as e:  # food2050 answers 200 even for unknown paths, so name the url
+    except (
+        ValueError
+    ) as e:  # food2050 answers 200 even for unknown paths, so name the url
         raise ValueError(f"{e} [{FOOD2050}/{m.food2050}]") from None
     dishes = []
     for e in entries:
@@ -210,7 +270,10 @@ def fetch_zfv(m: Mensa, day: dt.date) -> list[Dish]:
             d.raise_for_status()
             price, tags = parse_zfv_dish(d.text, e["name"])
         except requests.RequestException as ex:
-            print(f"[warn] {m.name}: price lookup failed ({type(ex).__name__})", file=sys.stderr)
+            print(
+                f"[warn] {m.name}: price lookup failed ({type(ex).__name__})",
+                file=sys.stderr,
+            )
         dishes.append(Dish(e["line"], e["name"], e["description"], price, tags))
     return dishes
 
@@ -218,8 +281,12 @@ def fetch_zfv(m: Mensa, day: dt.date) -> list[Dish]:
 # --------------------------------------------------------------------------
 def fetch_menu(m: Mensa, day: dt.date) -> list[Dish]:
     if m.source == "eth":
-        r = requests.get(f"{ETH_API}/weeklyrotas", params=eth_rota_params(m.eth_id, day),
-                         headers=UA, timeout=20)
+        r = requests.get(
+            f"{ETH_API}/weeklyrotas",
+            params=eth_rota_params(m.eth_id, day),
+            headers=UA,
+            timeout=20,
+        )
         r.raise_for_status()
         return parse_eth(r.json(), day)
     return fetch_zfv(m, day)
@@ -258,7 +325,9 @@ def build_message(day: dt.date, results: dict[str, list[Dish] | None]) -> str:
                 tags = f" _({', '.join(d.tags)})_" if d.tags else ""
                 desc = f": {cell(d.description)}" if d.description else ""
                 price = f"CHF {d.price}" if d.price else "–"
-                out.append(f"| {cell(d.category)} | **{cell(d.name)}**{desc}{tags} | {price} |")
+                out.append(
+                    f"| {cell(d.category)} | **{cell(d.name)}**{desc}{tags} | {price} |"
+                )
         out.append("")
 
     options = [m.name for m in MENSAS if results[m.key] is None or results[m.key]]
@@ -293,15 +362,23 @@ def probe(day: dt.date) -> None:
         try:
             r = requests.get(f"{ZFV_BASE}/{slug}", headers=UA, timeout=20)
             (out / f"zfv_{slug}.html").write_text(r.text, encoding="utf-8")
-            urls = sorted(set(re.findall(r"https?://app\.food2050\.ch/[^\"'\s<>\\]+", r.text)))
-            print(f"zfv {slug}: status={r.status_code} bytes={len(r.text)} food2050 urls: {urls[:5]}")
+            urls = sorted(
+                set(re.findall(r"https?://app\.food2050\.ch/[^\"'\s<>\\]+", r.text))
+            )
+            print(
+                f"zfv {slug}: status={r.status_code} bytes={len(r.text)} food2050 urls: {urls[:5]}"
+            )
         except requests.RequestException as e:
             print(f"zfv {slug}: {type(e).__name__}")
         if m.food2050:
             iso = day.isocalendar()
             try:
-                r = requests.get(f"{FOOD2050}/{m.food2050}/menu/weekly", headers=UA, timeout=20,
-                                 params={"week": iso.week, "year": iso.year, "day": iso.weekday})
+                r = requests.get(
+                    f"{FOOD2050}/{m.food2050}/menu/weekly",
+                    headers=UA,
+                    timeout=20,
+                    params={"week": iso.week, "year": iso.year, "day": iso.weekday},
+                )
                 (out / f"food2050_{m.key}.html").write_text(r.text, encoding="utf-8")
                 print(f"food2050 {m.key}: status={r.status_code} bytes={len(r.text)}")
             except requests.RequestException as e:
@@ -316,7 +393,11 @@ def at_lunch_hour(now: dt.datetime) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only-at-lunch-hour", action="store_true", help="skip unless it is 11:xx in Zurich")
+    ap.add_argument(
+        "--only-at-lunch-hour",
+        action="store_true",
+        help="skip unless it is 11:xx in Zurich",
+    )
     ap.add_argument("--dry-run", action="store_true", help="print instead of posting")
     ap.add_argument("--probe", action="store_true")
     ap.add_argument("--date", type=dt.date.fromisoformat)

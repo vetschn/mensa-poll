@@ -7,11 +7,8 @@ plus a `/poll` line to paste.
 ## Status
 - ETH (Clausiusbar 3, Polymensa/Polyterrasse 9, Polysnack 10): parser
   written against a real API sample.
-- UZH: parser written against the real food2050 weekly page (Platte).
-  Obere/Untere Mensa use a GUESSED food2050 path until confirmed (run
-  `mode=probe`, it prints the real ones).
-- Not yet verified: that food2050's weekly page is server-rendered when
-  fetched without a browser.
+- UZH: parser written against the real food2050 weekly pages; paths
+  verified for Platte, Obere and Untere Mensa.
 - `python test_parsers.py` runs the parser tests (fixtures copied from
   real samples).
 
